@@ -77,7 +77,7 @@ except ImportError:
 # --- Bot Configuration ---
 BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 HELPER_BOT_TOKEN = "8524914117:AAE1zTiTBm2npMdVguapC0HYbjFdaM56yyY"  # Add your second bot token here for load balancing PvP games in groups
-BOT_OWNER_IDS = [6083286836 7074070317]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
+BOT_OWNER_IDS = [6083286836, 7074070317]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
 BOT_OWNER_ID = BOT_OWNER_IDS[0]  # Primary admin (backward compat for withdrawal notifications)
 
 def is_admin(user_id: int) -> bool:
@@ -15378,6 +15378,61 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+    # FIX: Add highlow continuation
+    elif game_type == 'highlow':
+        text = f"🎯 Resuming High/Low Game (ID: <code>{game_id}</code>)..."
+        current_card = game['current_card']
+        deck = game['deck']
+        streak = game.get('streak', 0)
+        current_multiplier = game.get('current_multiplier', 1.0)
+        
+        card_name = get_card_name(current_card)
+        
+        # Calculate multipliers for each choice
+        high_mult = calculate_highlow_multiplier(current_card, deck, "high")
+        low_mult = calculate_highlow_multiplier(current_card, deck, "low")
+        tie_mult = calculate_highlow_multiplier(current_card, deck, "tie")
+        
+        # Build keyboard - row 1: Higher/Lower, row 2: Tie, row 3: Skip/Cashout
+        row1 = []
+        
+        # Add Higher button only if not King (13)
+        if current_card != 13:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬆️ Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+        
+        # Add Lower button only if not Ace (1)
+        if current_card != 1:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬇️ Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+        
+        # Row 2: Tie button
+        row2 = [apply_button_style(InlineKeyboardButton(f"🔄 Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+        
+        # Row 3: Skip Card and Cashout buttons (if streak > 0)
+        row3 = [apply_button_style(InlineKeyboardButton("⏭️ Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]
+        if streak > 0:
+            cashout_amount = game['bet_amount'] * current_multiplier
+            row3.append(apply_button_style(InlineKeyboardButton(f"💸 Cash Out (${cashout_amount:.2f})", callback_data=f"hl_cashout_{game_id}"), 'success'))
+        
+        keyboard = [row1, row2, row3]
+        
+        # Build multiplier text
+        mult_text = ""
+        if current_card != 13:
+            mult_text += f"⬆️ Higher: {high_mult:.2f}x\n"
+        if current_card != 1:
+            mult_text += f"⬇️ Lower: {low_mult:.2f}x\n"
+        mult_text += f"🔄 Tie: {tie_mult:.2f}x"
+        
+        msg = (
+            f"{text}\n\n"
+            f"🃏 <b>Current Card:</b> {card_name}\n"
+            f"💰 <b>Bet:</b> ${game['bet_amount']:.2f}\n"
+            f"🔥 <b>Streak:</b> {streak}\n"
+            f"📊 <b>Current Multiplier:</b> {current_multiplier:.2f}x\n\n"
+            f"<b>Multipliers:</b>\n{mult_text}"
+        )
+        
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=create_styled_keyboard(keyboard))
     else:
         await update.message.reply_text("This game type cannot be continued.")
 
