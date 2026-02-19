@@ -3600,7 +3600,7 @@ async def monitor_raffles_task(application):
                                 f"Raffle <code>{raffle_id}</code> has ended.\n"
                                 f"🏆 Winners: {len(winners)}\n"
                                 f"💰 Prize per winner: ${prize_per_winner:.2f}\n"
-                                f"🎫 Total tickets: {len(ticket_pool) + sum(participants.values())}"
+                                f"🎫 Total tickets: {sum(participants.values())}"
                             ),
                             parse_mode=ParseMode.HTML
                         )
@@ -16243,7 +16243,7 @@ async def raffle_ticket_cost_step(update: Update, context: ContextTypes.DEFAULT_
         
         await update.message.reply_text(
             f"✅ Ticket cost set to ${ticket_cost:.2f}\n\n"
-            f"Enter the <b>raffle duration in days</b>:\n\n"
+            f"Enter the <b>raffle duration in days</b> (1-30):\n\n"
             f"Example: 7 (raffle runs for 7 days)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
@@ -16265,7 +16265,7 @@ async def raffle_duration_step(update: Update, context: ContextTypes.DEFAULT_TYP
         
         await update.message.reply_text(
             f"✅ Duration set to {duration_days} days\n\n"
-            f"Enter the <b>number of winners</b>:\n\n"
+            f"Enter the <b>number of winners</b> (1-100):\n\n"
             f"Example: 5 (5 winners will be selected)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
@@ -16444,7 +16444,11 @@ async def raffles_active_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     
     msg = "🌟 <b>Active Raffles</b>\n\n"
-    for raffle in list(active_raffles.values())[:10]:  # Limit to 10
+    raffle_list = list(active_raffles.values())[:10]  # Limit to 10
+    if len(active_raffles) > 10:
+        msg += f"<i>Showing first 10 of {len(active_raffles)} active raffles</i>\n\n"
+    
+    for raffle in raffle_list:
         end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
         time_left = end_time - datetime.now(timezone.utc)
         total_tickets = sum(raffle['tickets'].values())
