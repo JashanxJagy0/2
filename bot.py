@@ -590,6 +590,8 @@ bot_settings = {
     "demo_enabled": True, # NEW: Toggle for demo feature
     "demo_amount": 10.0, # NEW: Demo claim amount
     "demo_cooldown": 600, # NEW: Demo cooldown in seconds (10 minutes)
+    "escrow_enabled": True, # NEW: Toggle for escrow feature
+    "ai_enabled": True, # NEW: Toggle for AI assistant feature
 }
 
 # NEW: Bonus adjustment system for weekly/monthly bonuses
@@ -5554,6 +5556,16 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await games_menu(update, context)
 
     elif data == "main_escrow":
+        # NEW: Check if escrow is enabled
+        if not bot_settings.get("escrow_enabled", True):
+            await safe_edit_message(
+                query,
+                "❌ <b>Escrow Feature Disabled</b>\n\n"
+                "This feature is currently disabled by the owner.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+            return
         await escrow_command(update, context, from_callback=True)
 
     elif data == "main_wallet":
@@ -5640,6 +5652,16 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     ## NEW FEATURE - AI Integration ##
     elif data == "main_ai":
+        # NEW: Check if AI is enabled
+        if not bot_settings.get("ai_enabled", True):
+            await safe_edit_message(
+                query,
+                "❌ <b>AI Assistant Disabled</b>\n\n"
+                "This feature is currently disabled by the owner.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+            return
         return await start_ai_conversation(update, context)
 
     elif data == "main_support":
@@ -14686,6 +14708,20 @@ ERC20_ABI = json.loads('[{"constant":true,"inputs":[],"name":"name","outputs":[{
 async def escrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback=False):
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    # NEW: Check if escrow feature is enabled
+    if not bot_settings.get("escrow_enabled", True):
+        error_msg = "❌ This feature is currently disabled by the owner."
+        if from_callback: 
+            await safe_edit_message(
+                update.callback_query, 
+                error_msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+        else: 
+            await update.message.reply_text(error_msg)
+        return
+    
     if not all([ESCROW_DEPOSIT_ADDRESS, ESCROW_WALLET_PRIVATE_KEY]):
         error_msg = "Escrow system is not configured by the owner yet."
         if from_callback: await safe_edit_message(update.callback_query, error_msg)
@@ -15900,6 +15936,12 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_maintenance
 async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
+    
+    # NEW: Check if AI feature is enabled
+    if not bot_settings.get("ai_enabled", True):
+        await update.message.reply_text("❌ This feature is currently disabled by the owner.")
+        return
+    
     prompt_text = ""
     # Check for reply context
     if update.message.reply_to_message and update.message.reply_to_message.text:
@@ -16948,6 +16990,64 @@ async def dailyon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bonus_amount = bot_settings.get("daily_bonus_amount", 0.50)
     await update.message.reply_text(f"✅ Daily bonus feature has been enabled. Current daily bonus amount: ${bonus_amount:.2f}")
 
+# NEW: Escrow toggle commands (owner only)
+async def escrow_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle escrow feature on/off. Usage: /escrow on|off"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ This is an admin-only command.")
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or context.args[0].lower() not in ['on', 'off']:
+        current_status = "enabled" if bot_settings.get("escrow_enabled", True) else "disabled"
+        await update.message.reply_text(
+            f"🛡️ <b>Escrow Feature Status</b>\n\n"
+            f"Current: <b>{current_status.upper()}</b>\n\n"
+            f"Usage: <code>/escrow on</code> or <code>/escrow off</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = context.args[0].lower()
+    if action == 'off':
+        bot_settings["escrow_enabled"] = False
+        save_bot_state()
+        await update.message.reply_text("✅ Escrow feature has been <b>DISABLED</b>. Users will not be able to access escrow services.", parse_mode=ParseMode.HTML)
+    else:
+        bot_settings["escrow_enabled"] = True
+        save_bot_state()
+        await update.message.reply_text("✅ Escrow feature has been <b>ENABLED</b>. Users can now access escrow services.", parse_mode=ParseMode.HTML)
+
+# NEW: AI toggle commands (owner only)
+async def ai_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle AI assistant feature on/off. Usage: /ai on|off"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ This is an admin-only command.")
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or context.args[0].lower() not in ['on', 'off']:
+        current_status = "enabled" if bot_settings.get("ai_enabled", True) else "disabled"
+        await update.message.reply_text(
+            f"🤖 <b>AI Assistant Feature Status</b>\n\n"
+            f"Current: <b>{current_status.upper()}</b>\n\n"
+            f"Usage: <code>/ai on</code> or <code>/ai off</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = context.args[0].lower()
+    if action == 'off':
+        bot_settings["ai_enabled"] = False
+        save_bot_state()
+        await update.message.reply_text("✅ AI Assistant feature has been <b>DISABLED</b>. Users will not be able to access AI services.", parse_mode=ParseMode.HTML)
+    else:
+        bot_settings["ai_enabled"] = True
+        save_bot_state()
+        await update.message.reply_text("✅ AI Assistant feature has been <b>ENABLED</b>. Users can now access AI services.", parse_mode=ParseMode.HTML)
+
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -17169,13 +17269,25 @@ async def more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
     await query.answer()
     
     # All items that were previously in the main menu (except Deposit, Withdraw, Games, Settings, Admin)
-    all_items = [
-        ("🛡️ Escrow", "main_escrow", 'primary'),  # BLUE
+    # NEW: Conditionally add Escrow and AI based on bot_settings
+    all_items = []
+    
+    # Add Escrow only if enabled
+    if bot_settings.get("escrow_enabled", True):
+        all_items.append(("🛡️ Escrow", "main_escrow", 'primary'))  # BLUE
+    
+    all_items.extend([
         ("💼 Wallet", "main_wallet", 'primary'),  # BLUE
         ("📈 Leaderboard", "main_leaderboard", 'primary'),  # BLUE
         ("🤝 Referral", "main_referral", 'primary'),  # BLUE
         ("🦄 Level", "main_level", 'primary'),  # BLUE
-        ("🤖 AI Assistant", "main_ai", 'primary'),  # BLUE
+    ])
+    
+    # Add AI Assistant only if enabled
+    if bot_settings.get("ai_enabled", True):
+        all_items.append(("🤖 AI Assistant", "main_ai", 'primary'))  # BLUE
+    
+    all_items.extend([
         ("🏆 Achievements", "main_achievements", 'primary'),  # BLUE
         ("🆘 Support", "main_support", 'primary'),  # BLUE
         ("❓ Help", "main_help", 'primary'),  # BLUE
@@ -17183,7 +17295,7 @@ async def more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
         ("🎟️ Claim Gift Code", "main_claim_gift", 'primary'),  # BLUE
         ("📊 Stats", "main_stats", 'primary'),  # BLUE
         ("💱 Currency", "settings_currency", 'primary'),  # BLUE
-    ]
+    ])
     
     keyboard = []
     # Add all items (2 per row) with colors
@@ -18423,6 +18535,8 @@ def main():
     app.add_handler(CommandHandler("setdaily", setdaily_command)) # NEW
     app.add_handler(CommandHandler("dailyoff", dailyoff_command)) # NEW
     app.add_handler(CommandHandler("dailyon", dailyon_command)) # NEW
+    app.add_handler(CommandHandler("escrow", escrow_toggle_command)) # NEW: Toggle escrow feature
+    app.add_handler(CommandHandler("aioff", ai_toggle_command)) # NEW: Toggle AI feature (using aioff/aion to avoid conflict with /ai command)
     app.add_handler(CommandHandler("games", games_menu)) # New alias
     app.add_handler(CommandHandler("tower", tower_command)) # NEW - Tower game
     app.add_handler(CommandHandler("tr", tower_command)) # NEW - Tower game alias
