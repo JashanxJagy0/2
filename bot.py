@@ -2875,6 +2875,20 @@ class BlockMonitor:
                             user_stats[telegram_id]["unwagered_deposit"] = (
                                 user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                             )
+                        
+                        # NEW: Referral deposit commission (0.5%)
+                        if telegram_id in user_stats:
+                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                            if referrer_id and referrer_id in user_stats:
+                                commission = new_native_amount * 0.005  # 0.5% in native crypto
+                                if 'commissions' not in user_stats[referrer_id]['referral']:
+                                    user_stats[referrer_id]['referral']['commissions'] = {}
+                                user_stats[referrer_id]['referral']['commissions'][symbol] = (
+                                    user_stats[referrer_id]['referral']['commissions'].get(symbol, 0.0) + commission
+                                )
+                                save_user_data(referrer_id)
+                                logging.info(f"Credited {commission} {symbol} deposit commission to referrer {referrer_id}")
+                        
                         save_user_data(telegram_id)
                         logging.info(f"Credited {new_native_amount} {symbol} to user {telegram_id}")
 
@@ -2943,6 +2957,20 @@ class BlockMonitor:
                                             user_stats[telegram_id]["unwagered_deposit"] = (
                                                 user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                             )
+                                        
+                                        # NEW: Referral deposit commission (0.5%)
+                                        if telegram_id in user_stats:
+                                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                            if referrer_id and referrer_id in user_stats:
+                                                commission = token_amount * 0.005  # 0.5% in native crypto
+                                                if 'commissions' not in user_stats[referrer_id]['referral']:
+                                                    user_stats[referrer_id]['referral']['commissions'] = {}
+                                                user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                                    user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
+                                                )
+                                                save_user_data(referrer_id)
+                                                logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                        
                                         save_user_data(telegram_id)
                                         logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
 
@@ -2994,6 +3022,20 @@ class BlockMonitor:
                                         user_stats[telegram_id]["unwagered_deposit"] = (
                                             user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                         )
+                                    
+                                    # NEW: Referral deposit commission (0.5%)
+                                    if telegram_id in user_stats:
+                                        referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                        if referrer_id and referrer_id in user_stats:
+                                            commission = new_token_amount * 0.005  # 0.5% in native crypto
+                                            if 'commissions' not in user_stats[referrer_id]['referral']:
+                                                user_stats[referrer_id]['referral']['commissions'] = {}
+                                            user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                                user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
+                                            )
+                                            save_user_data(referrer_id)
+                                            logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                    
                                     save_user_data(telegram_id)
                                     logging.info(f"Credited {new_token_amount} {token_name} to user {telegram_id}")
 
@@ -4963,17 +5005,31 @@ async def process_referral_commission(user_id, amount, commission_type):
         return
 
     if commission_type == 'bet':
-        rate = REFERRAL_BET_COMMISSION_RATE
+        # NEW: 0.2% wager commission in active currency
+        active_currency = get_active_currency(user_id)
+        price = LIVE_PRICES.get(active_currency, 1.0)
+        crypto_amount = amount / price  # Convert USD bet to crypto
+        commission_crypto = crypto_amount * 0.002  # 0.2% in active crypto
+        
+        # Ensure commissions dict exists
+        if 'commissions' not in user_stats[referrer_id]['referral']:
+            user_stats[referrer_id]['referral']['commissions'] = {}
+        
+        # Add commission to referrer's balance
+        user_stats[referrer_id]['referral']['commissions'][active_currency] = (
+            user_stats[referrer_id]['referral']['commissions'].get(active_currency, 0.0) + commission_crypto
+        )
+        
+        # Also update the old commission_earned field for backward compatibility
+        commission_usd = commission_crypto * price
+        user_stats[referrer_id]['referral']['commission_earned'] = (
+            user_stats[referrer_id]['referral'].get('commission_earned', 0.0) + commission_usd
+        )
+        
+        save_user_data(referrer_id)
+        logging.info(f"Awarded {commission_crypto} {active_currency} wager commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
     else:
         return
-
-    commission = amount * rate
-    if commission > 0:
-        await ensure_user_in_wallets(referrer_id)
-        credit_wallet(referrer_id, commission)
-        user_stats[referrer_id]['referral']['commission_earned'] += commission
-        save_user_data(referrer_id)
-        logging.info(f"Awarded ${commission:.4f} commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
 
 def update_stats_on_withdrawal(user_id, amount, tx_hash, method):
     stats = user_stats[user_id]
