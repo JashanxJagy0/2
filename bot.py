@@ -432,6 +432,8 @@ gift_codes = {} # NEW: To hold gift code data
 withdrawal_requests = {} # NEW: To hold pending withdrawal requests
 crypto_prices = {}  # NEW: Cache for cryptocurrency prices
 referral_codes = {}  # NEW: Maps referral code to user_id for referral system
+active_raffles = {}  # NEW: Active raffles with live wager tracking
+completed_raffles = []  # NEW: Completed/ended raffles history
 
 # --- Live Price Engine (Stake.com-style Multi-Currency) ---
 SUPPORTED_CRYPTOS = ["USDT", "BTC", "ETH", "SOL", "BNB", "TRX", "LTC"]
@@ -3507,6 +3509,123 @@ async def sweep_deposits_task(application):
             logging.error(f"Error in auto sweeper: {e}")
             await asyncio.sleep(SWEEP_INTERVAL)
 
+async def monitor_raffles_task(application):
+    """Background task to monitor and execute raffles"""
+    while not bot_stopped:
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Check each active raffle
+            for raffle_id, raffle in list(active_raffles.items()):
+                end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+                
+                # Check if raffle has ended
+                if now >= end_time:
+                    logging.info(f"Processing raffle {raffle_id}")
+                    
+                    # Get all participants with tickets
+                    participants = raffle['tickets']
+                    if not participants or sum(participants.values()) == 0:
+                        # No participants, refund creator
+                        creator_id = raffle['creator']
+                        prize = raffle['prize_usd']
+                        if creator_id in user_wallets:
+                            credit_wallet(creator_id, prize)
+                            save_user_data(creator_id)
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=creator_id,
+                                    text=f"🎰 Raffle <code>{raffle_id}</code> ended with no participants. Prize ${prize:.2f} refunded.",
+                                    parse_mode=ParseMode.HTML
+                                )
+                            except:
+                                pass
+                        
+                        # Move to completed
+                        completed_raffles.append({**raffle, 'winners': [], 'ended_at': str(now)})
+                        del active_raffles[raffle_id]
+                        save_bot_state()
+                        continue
+                    
+                    # Create ticket pool (each ticket is one entry)
+                    ticket_pool = []
+                    for user_id, ticket_count in participants.items():
+                        ticket_pool.extend([user_id] * ticket_count)
+                    
+                    # Select winners
+                    num_winners = min(raffle['total_winners'], len(set(ticket_pool)))  # Can't have more winners than unique participants
+                    winners = []
+                    winner_set = set()
+                    
+                    # Use random.sample to pick unique winners
+                    while len(winners) < num_winners and ticket_pool:
+                        picked = random.choice(ticket_pool)
+                        if picked not in winner_set:
+                            winners.append(picked)
+                            winner_set.add(picked)
+                        # Remove all tickets of this user to ensure uniqueness
+                        ticket_pool = [t for t in ticket_pool if t != picked]
+                    
+                    # Distribute prizes equally
+                    prize_per_winner = raffle['prize_usd'] / len(winners) if winners else 0
+                    
+                    for winner_id in winners:
+                        if winner_id in user_wallets:
+                            # Convert to winner's active currency
+                            active_currency = get_active_currency(winner_id)
+                            credit_wallet(winner_id, prize_per_winner, active_currency)
+                            save_user_data(winner_id)
+                            
+                            # Notify winner
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=winner_id,
+                                    text=(
+                                        f"🎉 <b>Congratulations!</b>\n\n"
+                                        f"You won ${prize_per_winner:.2f} in raffle <code>{raffle_id}</code>!\n"
+                                        f"Prize has been credited to your balance."
+                                    ),
+                                    parse_mode=ParseMode.HTML
+                                )
+                            except:
+                                pass
+                    
+                    # Notify creator
+                    creator_id = raffle['creator']
+                    try:
+                        await application.bot.send_message(
+                            chat_id=creator_id,
+                            text=(
+                                f"🎰 <b>Raffle Completed!</b>\n\n"
+                                f"Raffle <code>{raffle_id}</code> has ended.\n"
+                                f"🏆 Winners: {len(winners)}\n"
+                                f"💰 Prize per winner: ${prize_per_winner:.2f}\n"
+                                f"🎫 Total tickets: {len(ticket_pool) + sum(participants.values())}"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except:
+                        pass
+                    
+                    # Move to completed
+                    completed_raffles.append({
+                        **raffle,
+                        'winners': winners,
+                        'prize_per_winner': prize_per_winner,
+                        'ended_at': str(now)
+                    })
+                    del active_raffles[raffle_id]
+                    save_bot_state()
+                    logging.info(f"Raffle {raffle_id} completed with {len(winners)} winners")
+            
+            # Wait 60 seconds before next check
+            await asyncio.sleep(60)
+            
+        except Exception as e:
+            logging.error(f"Error in raffle monitoring: {e}")
+            logging.error(traceback.format_exc())
+            await asyncio.sleep(60)
+
 
 # ================================
 # END OF DEPOSIT SYSTEM
@@ -3652,7 +3771,8 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None, dis
  ADMIN_GIFT_CODE_AMOUNT, ADMIN_GIFT_CODE_CLAIMS, ADMIN_GIFT_CODE_WAGER, SETTINGS_WITHDRAWAL_ADDRESS, SETTINGS_WITHDRAWAL_ADDRESS_CHANGE,
  WITHDRAWAL_AMOUNT, WITHDRAWAL_APPROVAL_TXID, TOWER_BET_AMOUNT, PF_CHANGE_CLIENT_SEED_INPUT,
  PF_VERIFY_INPUT_SERVER_SEED, PF_VERIFY_INPUT_CLIENT_SEED, PF_VERIFY_INPUT_NONCE, PF_VERIFY_INPUT_PARAM,
- ROULETTE_BET_AMOUNT, SELECT_WHO_ROLLS_FIRST) = range(32)
+ ROULETTE_BET_AMOUNT, SELECT_WHO_ROLLS_FIRST,
+ RAFFLE_PRIZE_AMOUNT, RAFFLE_TICKET_COST, RAFFLE_DURATION, RAFFLE_NUM_WINNERS) = range(36)
 
 # --- GAME MULTIPLIERS AND CONFIGS ---
 
@@ -4183,7 +4303,9 @@ def save_bot_state():
         'escrow_deals': escrow_deals,
         'bot_stopped': bot_stopped,
         'bot_settings': bot_settings, # NEW
-        'referral_codes': referral_codes # NEW: Referral system
+        'referral_codes': referral_codes, # NEW: Referral system
+        'active_raffles': active_raffles, # NEW: Raffle system
+        'completed_raffles': completed_raffles # NEW: Raffle system
     }
     try:
         with open(STATE_FILE, "w") as f:
@@ -4199,7 +4321,7 @@ def save_bot_state():
 
 def load_bot_state():
     """Loads the bot state from a single JSON file."""
-    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, escrow_deals, bot_stopped, bot_settings, group_settings, recovery_data, gift_codes, referral_codes
+    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, escrow_deals, bot_stopped, bot_settings, group_settings, recovery_data, gift_codes, referral_codes, active_raffles, completed_raffles
 
     # Load individual files first as a fallback
     load_all_user_data()
@@ -4228,6 +4350,8 @@ def load_bot_state():
             bot_stopped = state.get('bot_stopped', False)
             bot_settings.update(state.get('bot_settings', {})) # NEW
             referral_codes.update(state.get('referral_codes', {})) # NEW: Referral system
+            active_raffles.update(state.get('active_raffles', {})) # NEW: Raffle system
+            completed_raffles.extend(state.get('completed_raffles', [])) # NEW: Raffle system
             logging.info("Bot state restored successfully from state file.")
         except (json.JSONDecodeError, Exception) as e:
             logging.error(f"Could not load bot state from {STATE_FILE}: {e}. Relying on individual files.")
@@ -5195,6 +5319,31 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
     stats.setdefault("monthly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
     stats["monthly_stats"]["weighted_wager"] += weighted_wager
     stats["monthly_stats"]["net_loss"] += net_loss_this_bet
+    
+    # NEW: Update raffle wager tracking
+    for raffle_id, raffle in list(active_raffles.items()):
+        # Check eligibility
+        eligible = False
+        if raffle['type'] == 'all':
+            eligible = True
+        elif raffle['type'] == 'referrals':
+            # Check if user is a referral of the creator
+            if user_id in user_stats and user_stats[user_id]['referral'].get('referrer_id') == raffle['creator']:
+                eligible = True
+        
+        if eligible:
+            # Add wager to tracker
+            if user_id not in raffle['wager_tracker']:
+                raffle['wager_tracker'][user_id] = 0.0
+            raffle['wager_tracker'][user_id] += amount
+            
+            # Check if user earned tickets
+            if user_id not in raffle['tickets']:
+                raffle['tickets'][user_id] = 0
+            
+            while raffle['wager_tracker'][user_id] >= raffle['ticket_cost']:
+                raffle['tickets'][user_id] += 1
+                raffle['wager_tracker'][user_id] -= raffle['ticket_cost']
     
     # NEW: Update leaderboards
     update_leaderboards(user_id, amount, win_amount, game_type, multiplier)
@@ -15996,6 +16145,392 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (BadRequest, Forbidden):
         pass
 
+# ═══════════════════════════════════════════════════════════════════
+# NEW FEATURE: COMPREHENSIVE RAFFLE SYSTEM
+# ═══════════════════════════════════════════════════════════════════
+
+@check_banned
+@check_maintenance
+async def raffle_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for /raffle command - show type selection"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🔵 Referrals Only", callback_data="raffle_type_referrals"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🟢 All Players", callback_data="raffle_type_all"), 'success')],
+        [apply_button_style(InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel"), 'danger')]
+    ]
+    
+    await safe_edit_message(
+        query,
+        "🎰 <b>Create a Raffle</b>\n\n"
+        "Choose the raffle type:\n\n"
+        "🔵 <b>Referrals Only:</b> Only your referrals can participate\n"
+        "🟢 <b>All Players:</b> Anyone can participate by wagering",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    return ConversationHandler.END
+
+async def raffle_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle raffle type selection"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    raffle_type = query.data.split('_')[-1]  # 'referrals' or 'all'
+    context.user_data['raffle_type'] = raffle_type
+    context.user_data['raffle_creator'] = user.id
+    
+    await safe_edit_message(
+        query,
+        f"🎰 <b>Create Raffle - {raffle_type.title()}</b>\n\n"
+        f"Enter the <b>prize amount in USD</b>:\n\n"
+        f"Your balance: ${get_active_balance_usd(user.id):.2f}\n\n"
+        f"The amount will be deducted from your balance immediately.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+    )
+    return RAFFLE_PRIZE_AMOUNT
+
+async def raffle_prize_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect prize amount"""
+    user = update.effective_user
+    try:
+        prize_usd = float(update.message.text)
+        if prize_usd <= 0:
+            await update.message.reply_text("❌ Prize must be positive. Try again:")
+            return RAFFLE_PRIZE_AMOUNT
+        
+        balance = get_active_balance_usd(user.id)
+        if prize_usd > balance:
+            await update.message.reply_text(
+                f"❌ Insufficient balance. You have ${balance:.2f}. Try again:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+            )
+            return RAFFLE_PRIZE_AMOUNT
+        
+        # Deduct prize from balance immediately
+        deduct_wallet(user.id, prize_usd)
+        save_user_data(user.id)
+        
+        context.user_data['raffle_prize_usd'] = prize_usd
+        
+        await update.message.reply_text(
+            f"✅ Prize set to ${prize_usd:.2f} (deducted from balance)\n\n"
+            f"Enter the <b>wager amount needed for 1 ticket</b> (in USD):\n\n"
+            f"Example: 10 (users need to wager $10 to earn 1 ticket)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_TICKET_COST
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Enter a number:")
+        return RAFFLE_PRIZE_AMOUNT
+
+async def raffle_ticket_cost_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect ticket cost"""
+    try:
+        ticket_cost = float(update.message.text)
+        if ticket_cost <= 0:
+            await update.message.reply_text("❌ Ticket cost must be positive. Try again:")
+            return RAFFLE_TICKET_COST
+        
+        context.user_data['raffle_ticket_cost'] = ticket_cost
+        
+        await update.message.reply_text(
+            f"✅ Ticket cost set to ${ticket_cost:.2f}\n\n"
+            f"Enter the <b>raffle duration in days</b>:\n\n"
+            f"Example: 7 (raffle runs for 7 days)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_DURATION
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Enter a number:")
+        return RAFFLE_TICKET_COST
+
+async def raffle_duration_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect raffle duration"""
+    try:
+        duration_days = int(update.message.text)
+        if duration_days <= 0 or duration_days > 30:
+            await update.message.reply_text("❌ Duration must be between 1 and 30 days. Try again:")
+            return RAFFLE_DURATION
+        
+        context.user_data['raffle_duration_days'] = duration_days
+        
+        await update.message.reply_text(
+            f"✅ Duration set to {duration_days} days\n\n"
+            f"Enter the <b>number of winners</b>:\n\n"
+            f"Example: 5 (5 winners will be selected)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_NUM_WINNERS
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Enter an integer:")
+        return RAFFLE_DURATION
+
+async def raffle_num_winners_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect number of winners and create raffle"""
+    user = update.effective_user
+    try:
+        num_winners = int(update.message.text)
+        if num_winners <= 0 or num_winners > 100:
+            await update.message.reply_text("❌ Number of winners must be between 1 and 100. Try again:")
+            return RAFFLE_NUM_WINNERS
+        
+        # Create the raffle
+        raffle_id = generate_unique_id("RAFFLE")
+        end_time = datetime.now(timezone.utc) + timedelta(days=context.user_data['raffle_duration_days'])
+        
+        active_raffles[raffle_id] = {
+            "id": raffle_id,
+            "creator": user.id,
+            "type": context.user_data['raffle_type'],  # 'referrals' or 'all'
+            "prize_usd": context.user_data['raffle_prize_usd'],
+            "ticket_cost": context.user_data['raffle_ticket_cost'],
+            "end_time": str(end_time),
+            "total_winners": num_winners,
+            "tickets": {},  # {user_id: ticket_count}
+            "wager_tracker": {}  # {user_id: accumulated_wager}
+        }
+        save_bot_state()
+        
+        # Clear context data
+        for key in ['raffle_type', 'raffle_creator', 'raffle_prize_usd', 'raffle_ticket_cost', 'raffle_duration_days']:
+            context.user_data.pop(key, None)
+        
+        await update.message.reply_text(
+            f"✅ <b>Raffle Created!</b>\n\n"
+            f"🎰 <b>Raffle ID:</b> <code>{raffle_id}</code>\n"
+            f"💰 <b>Prize Pool:</b> ${active_raffles[raffle_id]['prize_usd']:.2f}\n"
+            f"🎫 <b>Ticket Cost:</b> ${active_raffles[raffle_id]['ticket_cost']:.2f} wagered\n"
+            f"👥 <b>Type:</b> {active_raffles[raffle_id]['type'].title()}\n"
+            f"🏆 <b>Winners:</b> {num_winners}\n"
+            f"⏰ <b>Ends:</b> {end_time.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"Players will automatically earn tickets by wagering!\n"
+            f"Use <code>/info {raffle_id}</code> to check progress.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Enter an integer:")
+        return RAFFLE_NUM_WINNERS
+
+async def raffle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel raffle creation"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    # Refund prize if it was deducted
+    if 'raffle_prize_usd' in context.user_data:
+        prize = context.user_data['raffle_prize_usd']
+        credit_wallet(user.id, prize)
+        save_user_data(user.id)
+        await safe_edit_message(query, f"❌ Raffle creation cancelled. ${prize:.2f} refunded.", parse_mode=ParseMode.HTML)
+    else:
+        await safe_edit_message(query, "❌ Raffle creation cancelled.", parse_mode=ParseMode.HTML)
+    
+    # Clear context
+    for key in ['raffle_type', 'raffle_creator', 'raffle_prize_usd', 'raffle_ticket_cost', 'raffle_duration_days']:
+        context.user_data.pop(key, None)
+    
+    return ConversationHandler.END
+
+@check_banned
+@check_maintenance
+async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start raffle creation flow"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🔵 Referrals Only", callback_data="raffle_type_referrals"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🟢 All Players", callback_data="raffle_type_all"), 'success')],
+    ]
+    
+    sent_message = await update.message.reply_text(
+        "🎰 <b>Create a Raffle</b>\n\n"
+        "Choose the raffle type:\n\n"
+        "🔵 <b>Referrals Only:</b> Only your referrals can participate\n"
+        "🟢 <b>All Players:</b> Anyone can participate by wagering",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    set_menu_owner(sent_message, user.id)
+
+@check_banned
+@check_maintenance
+async def raffles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show raffles dashboard"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🎰 My Raffles", callback_data=f"raffles_mine_{user.id}"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🌟 Active Raffles", callback_data="raffles_active"), 'success')],
+    ]
+    
+    sent_message = await update.message.reply_text(
+        "🎰 <b>Raffle Dashboard</b>\n\n"
+        "Select an option:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    set_menu_owner(sent_message, user.id)
+
+async def raffles_mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's created raffles"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    my_raffles = [r for r in active_raffles.values() if r['creator'] == user_id]
+    
+    if not my_raffles:
+        await safe_edit_message(
+            query,
+            "❌ You haven't created any active raffles.\n\n"
+            "Use <code>/raffle</code> to create one!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+        )
+        return
+    
+    msg = "🎰 <b>Your Active Raffles</b>\n\n"
+    for raffle in my_raffles:
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        
+        msg += (
+            f"<b>ID:</b> <code>{raffle['id']}</code>\n"
+            f"💰 Prize: ${raffle['prize_usd']:.2f} | 🎫 {total_tickets} tickets | 👥 {participants} players\n"
+            f"⏰ Ends in: {time_left.days}d {time_left.seconds//3600}h\n"
+            f"Use <code>/info {raffle['id']}</code> for details\n\n"
+        )
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+    )
+
+async def raffles_active_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active raffles"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not active_raffles:
+        await safe_edit_message(
+            query,
+            "❌ No active raffles at the moment.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+        )
+        return
+    
+    msg = "🌟 <b>Active Raffles</b>\n\n"
+    for raffle in list(active_raffles.values())[:10]:  # Limit to 10
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        
+        msg += (
+            f"<b>ID:</b> <code>{raffle['id']}</code>\n"
+            f"💰 Prize: ${raffle['prize_usd']:.2f} | Type: {raffle['type'].title()}\n"
+            f"🎫 {total_tickets} tickets | 👥 {participants} players | 🏆 {raffle['total_winners']} winners\n"
+            f"⏰ {time_left.days}d {time_left.seconds//3600}h left\n\n"
+        )
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+    )
+
+async def raffles_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return to raffles menu"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🎰 My Raffles", callback_data=f"raffles_mine_{user.id}"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🌟 Active Raffles", callback_data="raffles_active"), 'success')],
+    ]
+    
+    await safe_edit_message(
+        query,
+        "🎰 <b>Raffle Dashboard</b>\n\n"
+        "Select an option:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+
+@check_banned
+@check_maintenance
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed raffle info"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: <code>/info RAFFLE_ID</code>", parse_mode=ParseMode.HTML)
+        return
+    
+    raffle_id = context.args[0]
+    
+    if raffle_id not in active_raffles:
+        await update.message.reply_text("❌ Raffle not found or has ended.")
+        return
+    
+    raffle = active_raffles[raffle_id]
+    end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+    time_left = end_time - datetime.now(timezone.utc)
+    total_tickets = sum(raffle['tickets'].values())
+    participants = len(raffle['tickets'])
+    
+    # User's tickets
+    user_tickets = raffle['tickets'].get(user.id, 0)
+    user_wager = raffle['wager_tracker'].get(user.id, 0.0)
+    
+    msg = (
+        f"🎰 <b>Raffle Details</b>\n\n"
+        f"<b>ID:</b> <code>{raffle_id}</code>\n"
+        f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
+        f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
+        f"👥 <b>Type:</b> {raffle['type'].title()}\n"
+        f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
+        f"⏰ <b>Time Left:</b> {time_left.days}d {time_left.seconds//3600}h {(time_left.seconds//60)%60}m\n\n"
+        f"📊 <b>Statistics:</b>\n"
+        f"🎫 Total Tickets: {total_tickets}\n"
+        f"👥 Participants: {participants}\n\n"
+        f"<b>Your Progress:</b>\n"
+        f"🎫 Your Tickets: {user_tickets}\n"
+        f"💵 Your Wagered: ${user_wager:.2f}\n"
+    )
+    
+    if raffle['type'] == 'referrals':
+        msg += f"\n💡 Only referrals of the creator can participate"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 ## NEW FEATURE - /level and /levelall commands ##
 def create_progress_bar(progress, total, length=10):
     """Creates a text-based progress bar."""
@@ -18370,6 +18905,9 @@ async def post_init(application: Application):
     # Start the live price engine (MEXC API, every 5 minutes)
     application.create_task(update_live_prices())
     
+    # Start the raffle monitoring task
+    application.create_task(monitor_raffles_task(application))
+    
     logging.info("Background tasks started successfully via post_init")
 # --- Main Function ---)
 # ===== BONUS ADJUSTMENT SYSTEM =====
@@ -18764,6 +19302,19 @@ def main():
         per_message=False,
         conversation_timeout=timedelta(minutes=5).total_seconds()
     )
+    
+    raffle_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(raffle_type_callback, pattern="^raffle_type_")],
+        states={
+            RAFFLE_PRIZE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_prize_step)],
+            RAFFLE_TICKET_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_ticket_cost_step)],
+            RAFFLE_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_duration_step)],
+            RAFFLE_NUM_WINNERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_num_winners_step)],
+        },
+        fallbacks=[CallbackQueryHandler(raffle_cancel_callback, pattern="^raffle_cancel$")],
+        per_user=True,
+        conversation_timeout=timedelta(minutes=5).total_seconds()
+    )
 
     recovery_handler = ConversationHandler(
         entry_points=[CommandHandler("recover", recover_command)],
@@ -18848,6 +19399,9 @@ def main():
     app.add_handler(CommandHandler("referral", referral_command))
     app.add_handler(CommandHandler("setcode", setcode_command)) # NEW: Referral system
     app.add_handler(CommandHandler("code", code_command)) # NEW: Referral system
+    app.add_handler(CommandHandler("raffle", raffle_command)) # NEW: Raffle system
+    app.add_handler(CommandHandler("raffles", raffles_command)) # NEW: Raffle system
+    app.add_handler(CommandHandler("info", info_command)) # NEW: Raffle system
     app.add_handler(CommandHandler("user", user_info_command))
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("p", price_command))
@@ -18901,6 +19455,7 @@ def main():
     app.add_handler(tower_handler)  # NEW - Tower game conversation
     app.add_handler(pvb_handler)
     app.add_handler(ai_handler)
+    app.add_handler(raffle_handler)  # NEW - Raffle creation conversation
     app.add_handler(recovery_handler)
     app.add_handler(withdrawal_address_handler)
     app.add_handler(withdrawal_flow_handler)
@@ -18933,6 +19488,9 @@ def main():
     app.add_handler(CallbackQueryHandler(level_all_command, pattern=r"^levels_")) # NEW - Level pagination
     app.add_handler(CallbackQueryHandler(referral_transfer_callback, pattern=r"^ref_transfer_")) # NEW - Referral transfer
     app.add_handler(CallbackQueryHandler(referral_check_callback, pattern=r"^ref_check_")) # NEW - Check referrals
+    app.add_handler(CallbackQueryHandler(raffles_mine_callback, pattern=r"^raffles_mine_")) # NEW - Raffle system
+    app.add_handler(CallbackQueryHandler(raffles_active_callback, pattern=r"^raffles_active")) # NEW - Raffle system
+    app.add_handler(CallbackQueryHandler(raffles_back_callback, pattern=r"^raffles_back")) # NEW - Raffle system
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern=r"^price_update_")) # NEW
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_")); app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_"))
     
