@@ -10186,6 +10186,9 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
     bot_total = sum(bot_rolls)
     bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
     
+    # NEW: Store bot roll values in context to prevent double rolling
+    context.user_data['pre_rolled_bot_values'] = bot_rolls
+    
     # Get user for mention
     user_id = match.get("host_id")
     user_mention = f'<a href="tg://user?id={user_id}">Player</a>' if user_id else "Player"
@@ -10650,6 +10653,9 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
             await asyncio.sleep(3.5)  # Wait for animation
     
     match["player_rolls"][0] = roll_values  # 0 = Bot
+    
+    # NEW: Store bot roll values in context to prevent double rolling
+    context.user_data['pre_rolled_bot_values'] = roll_values
     
     await query.edit_message_text(
         f"🤖 <b>BOT ROLLED FIRST!</b>\n\n"
@@ -13998,31 +14004,40 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
                 
-                # NOW bot rolls
-                bot_rolls = []
-                chat_type = update.effective_chat.type
-                for i in range(game_rolls):
-                    animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
-                    try:
-                        bot_dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, expected_emoji)
-                        bot_rolls.append(bot_dice_msg.dice.value)
-                        # Faster animation if helper bot was used
-                        if used_helper:
-                            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
-                        else:
-                            await asyncio.sleep(animation_wait)  # Smart wait based on chat type
-                    except Exception as e:
-                        logging.error(f"Error sending dice in PvB game: {e}")
-                        await update.message.reply_text("❌ An error occurred. Game terminated.")
-                        game['status'] = 'error'
-                        del context.chat_data[f"active_pvb_game_{user.id}"]
-                        if user.id in active_pvb_games:
-                            del active_pvb_games[user.id]
-                        # Refund bet
-                        credit_wallet(user.id, game['bet_amount'])
-                        update_pnl(user.id)
-                        save_user_data(user.id)
-                        return
+                # Check if bot already rolled (via "Bot rolls first" button)
+                pre_rolled_values = context.user_data.get('pre_rolled_bot_values')
+                
+                if pre_rolled_values:
+                    # Bot already rolled - use those values
+                    bot_rolls = pre_rolled_values
+                    # Clear the stored values
+                    context.user_data.pop('pre_rolled_bot_values', None)
+                else:
+                    # Bot hasn't rolled yet - roll now
+                    bot_rolls = []
+                    chat_type = update.effective_chat.type
+                    for i in range(game_rolls):
+                        animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
+                        try:
+                            bot_dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, expected_emoji)
+                            bot_rolls.append(bot_dice_msg.dice.value)
+                            # Faster animation if helper bot was used
+                            if used_helper:
+                                await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                            else:
+                                await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+                        except Exception as e:
+                            logging.error(f"Error sending dice in PvB game: {e}")
+                            await update.message.reply_text("❌ An error occurred. Game terminated.")
+                            game['status'] = 'error'
+                            del context.chat_data[f"active_pvb_game_{user.id}"]
+                            if user.id in active_pvb_games:
+                                del active_pvb_games[user.id]
+                            # Refund bet
+                            credit_wallet(user.id, game['bet_amount'])
+                            update_pnl(user.id)
+                            save_user_data(user.id)
+                            return
                 
                 game["bot_rolls"] = bot_rolls
                 bot_total = sum(bot_rolls)
@@ -14124,6 +14139,9 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     game["bot_rolls"] = bot_rolls
                     bot_total = sum(bot_rolls)
                     bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
+                    
+                    # NEW: Store bot roll values in context for next user response
+                    context.user_data['pre_rolled_bot_values'] = bot_rolls
                     
                     username_display = user.first_name if user.first_name else "Player"
                     await update.message.reply_text(
