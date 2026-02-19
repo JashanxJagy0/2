@@ -77,7 +77,7 @@ except ImportError:
 # --- Bot Configuration ---
 BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 HELPER_BOT_TOKEN = "8524914117:AAE1zTiTBm2npMdVguapC0HYbjFdaM56yyY"  # Add your second bot token here for load balancing PvP games in groups
-BOT_OWNER_IDS = [6083286836 7074070317]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
+BOT_OWNER_IDS = [6083286836, 7074070317]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
 BOT_OWNER_ID = BOT_OWNER_IDS[0]  # Primary admin (backward compat for withdrawal notifications)
 
 def is_admin(user_id: int) -> bool:
@@ -431,6 +431,9 @@ provably_fair_records = {} # NEW: Store provably fair verification data for comp
 gift_codes = {} # NEW: To hold gift code data
 withdrawal_requests = {} # NEW: To hold pending withdrawal requests
 crypto_prices = {}  # NEW: Cache for cryptocurrency prices
+referral_codes = {}  # NEW: Maps referral code to user_id for referral system
+active_raffles = {}  # NEW: Active raffles with live wager tracking
+completed_raffles = []  # NEW: Completed/ended raffles history
 
 # --- Live Price Engine (Stake.com-style Multi-Currency) ---
 SUPPORTED_CRYPTOS = ["USDT", "BTC", "ETH", "SOL", "BNB", "TRX", "LTC"]
@@ -590,6 +593,8 @@ bot_settings = {
     "demo_enabled": True, # NEW: Toggle for demo feature
     "demo_amount": 10.0, # NEW: Demo claim amount
     "demo_cooldown": 600, # NEW: Demo cooldown in seconds (10 minutes)
+    "escrow_enabled": True, # NEW: Toggle for escrow feature
+    "ai_enabled": True, # NEW: Toggle for AI assistant feature
 }
 
 # NEW: Bonus adjustment system for weekly/monthly bonuses
@@ -2872,6 +2877,20 @@ class BlockMonitor:
                             user_stats[telegram_id]["unwagered_deposit"] = (
                                 user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                             )
+                        
+                        # NEW: Referral deposit commission (0.5%)
+                        if telegram_id in user_stats:
+                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                            if referrer_id and referrer_id in user_stats:
+                                commission = new_native_amount * 0.005  # 0.5% in native crypto
+                                if 'commissions' not in user_stats[referrer_id]['referral']:
+                                    user_stats[referrer_id]['referral']['commissions'] = {}
+                                user_stats[referrer_id]['referral']['commissions'][symbol] = (
+                                    user_stats[referrer_id]['referral']['commissions'].get(symbol, 0.0) + commission
+                                )
+                                save_user_data(referrer_id)
+                                logging.info(f"Credited {commission} {symbol} deposit commission to referrer {referrer_id}")
+                        
                         save_user_data(telegram_id)
                         logging.info(f"Credited {new_native_amount} {symbol} to user {telegram_id}")
 
@@ -2940,6 +2959,20 @@ class BlockMonitor:
                                             user_stats[telegram_id]["unwagered_deposit"] = (
                                                 user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                             )
+                                        
+                                        # NEW: Referral deposit commission (0.5%)
+                                        if telegram_id in user_stats:
+                                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                            if referrer_id and referrer_id in user_stats:
+                                                commission = token_amount * 0.005  # 0.5% in native crypto
+                                                if 'commissions' not in user_stats[referrer_id]['referral']:
+                                                    user_stats[referrer_id]['referral']['commissions'] = {}
+                                                user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                                    user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
+                                                )
+                                                save_user_data(referrer_id)
+                                                logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                        
                                         save_user_data(telegram_id)
                                         logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
 
@@ -2991,6 +3024,20 @@ class BlockMonitor:
                                         user_stats[telegram_id]["unwagered_deposit"] = (
                                             user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                         )
+                                    
+                                    # NEW: Referral deposit commission (0.5%)
+                                    if telegram_id in user_stats:
+                                        referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                        if referrer_id and referrer_id in user_stats:
+                                            commission = new_token_amount * 0.005  # 0.5% in native crypto
+                                            if 'commissions' not in user_stats[referrer_id]['referral']:
+                                                user_stats[referrer_id]['referral']['commissions'] = {}
+                                            user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                                user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
+                                            )
+                                            save_user_data(referrer_id)
+                                            logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                    
                                     save_user_data(telegram_id)
                                     logging.info(f"Credited {new_token_amount} {token_name} to user {telegram_id}")
 
@@ -3462,6 +3509,123 @@ async def sweep_deposits_task(application):
             logging.error(f"Error in auto sweeper: {e}")
             await asyncio.sleep(SWEEP_INTERVAL)
 
+async def monitor_raffles_task(application):
+    """Background task to monitor and execute raffles"""
+    while not bot_stopped:
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Check each active raffle
+            for raffle_id, raffle in list(active_raffles.items()):
+                end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+                
+                # Check if raffle has ended
+                if now >= end_time:
+                    logging.info(f"Processing raffle {raffle_id}")
+                    
+                    # Get all participants with tickets
+                    participants = raffle['tickets']
+                    if not participants or sum(participants.values()) == 0:
+                        # No participants, refund creator
+                        creator_id = raffle['creator']
+                        prize = raffle['prize_usd']
+                        if creator_id in user_wallets:
+                            credit_wallet(creator_id, prize)
+                            save_user_data(creator_id)
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=creator_id,
+                                    text=f"🎰 Raffle <code>{raffle_id}</code> ended with no participants. Prize ${prize:.2f} refunded.",
+                                    parse_mode=ParseMode.HTML
+                                )
+                            except:
+                                pass
+                        
+                        # Move to completed
+                        completed_raffles.append({**raffle, 'winners': [], 'ended_at': str(now)})
+                        del active_raffles[raffle_id]
+                        save_bot_state()
+                        continue
+                    
+                    # Create ticket pool (each ticket is one entry)
+                    ticket_pool = []
+                    for user_id, ticket_count in participants.items():
+                        ticket_pool.extend([user_id] * ticket_count)
+                    
+                    # Select winners
+                    num_winners = min(raffle['total_winners'], len(set(ticket_pool)))  # Can't have more winners than unique participants
+                    winners = []
+                    winner_set = set()
+                    
+                    # Use random.sample to pick unique winners
+                    while len(winners) < num_winners and ticket_pool:
+                        picked = random.choice(ticket_pool)
+                        if picked not in winner_set:
+                            winners.append(picked)
+                            winner_set.add(picked)
+                        # Remove all tickets of this user to ensure uniqueness
+                        ticket_pool = [t for t in ticket_pool if t != picked]
+                    
+                    # Distribute prizes equally
+                    prize_per_winner = raffle['prize_usd'] / len(winners) if winners else 0
+                    
+                    for winner_id in winners:
+                        if winner_id in user_wallets:
+                            # Convert to winner's active currency
+                            active_currency = get_active_currency(winner_id)
+                            credit_wallet(winner_id, prize_per_winner, active_currency)
+                            save_user_data(winner_id)
+                            
+                            # Notify winner
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=winner_id,
+                                    text=(
+                                        f"🎉 <b>Congratulations!</b>\n\n"
+                                        f"You won ${prize_per_winner:.2f} in raffle <code>{raffle_id}</code>!\n"
+                                        f"Prize has been credited to your balance."
+                                    ),
+                                    parse_mode=ParseMode.HTML
+                                )
+                            except:
+                                pass
+                    
+                    # Notify creator
+                    creator_id = raffle['creator']
+                    try:
+                        await application.bot.send_message(
+                            chat_id=creator_id,
+                            text=(
+                                f"🎰 <b>Raffle Completed!</b>\n\n"
+                                f"Raffle <code>{raffle_id}</code> has ended.\n"
+                                f"🏆 Winners: {len(winners)}\n"
+                                f"💰 Prize per winner: ${prize_per_winner:.2f}\n"
+                                f"🎫 Total tickets: {sum(participants.values())}"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+                    except:
+                        pass
+                    
+                    # Move to completed
+                    completed_raffles.append({
+                        **raffle,
+                        'winners': winners,
+                        'prize_per_winner': prize_per_winner,
+                        'ended_at': str(now)
+                    })
+                    del active_raffles[raffle_id]
+                    save_bot_state()
+                    logging.info(f"Raffle {raffle_id} completed with {len(winners)} winners")
+            
+            # Wait 60 seconds before next check
+            await asyncio.sleep(60)
+            
+        except Exception as e:
+            logging.error(f"Error in raffle monitoring: {e}")
+            logging.error(traceback.format_exc())
+            await asyncio.sleep(60)
+
 
 # ================================
 # END OF DEPOSIT SYSTEM
@@ -3607,7 +3771,8 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None, dis
  ADMIN_GIFT_CODE_AMOUNT, ADMIN_GIFT_CODE_CLAIMS, ADMIN_GIFT_CODE_WAGER, SETTINGS_WITHDRAWAL_ADDRESS, SETTINGS_WITHDRAWAL_ADDRESS_CHANGE,
  WITHDRAWAL_AMOUNT, WITHDRAWAL_APPROVAL_TXID, TOWER_BET_AMOUNT, PF_CHANGE_CLIENT_SEED_INPUT,
  PF_VERIFY_INPUT_SERVER_SEED, PF_VERIFY_INPUT_CLIENT_SEED, PF_VERIFY_INPUT_NONCE, PF_VERIFY_INPUT_PARAM,
- ROULETTE_BET_AMOUNT, SELECT_WHO_ROLLS_FIRST) = range(32)
+ ROULETTE_BET_AMOUNT, SELECT_WHO_ROLLS_FIRST,
+ RAFFLE_PRIZE_AMOUNT, RAFFLE_TICKET_COST, RAFFLE_DURATION, RAFFLE_NUM_WINNERS) = range(36)
 
 # --- GAME MULTIPLIERS AND CONFIGS ---
 
@@ -3838,6 +4003,14 @@ def generate_unique_id(prefix='G'):
     timestamp = datetime.now(timezone.utc).strftime('%y%m%d%H%M%S')
     random_part = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
     return f"{prefix}-{timestamp}-{random_part}"
+
+def generate_unique_referral_code():
+    """Generate a unique 6-character alphanumeric referral code.
+    Returns a code that doesn't already exist in referral_codes dictionary."""
+    while True:
+        code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+        if code not in referral_codes:
+            return code
 
 def create_hash(server_seed, client_seed, nonce):
     combined = f"{server_seed}:{client_seed}:{nonce}"
@@ -4129,7 +4302,10 @@ def save_bot_state():
         'user_pending_invitations': user_pending_invitations,
         'escrow_deals': escrow_deals,
         'bot_stopped': bot_stopped,
-        'bot_settings': bot_settings # NEW
+        'bot_settings': bot_settings, # NEW
+        'referral_codes': referral_codes, # NEW: Referral system
+        'active_raffles': active_raffles, # NEW: Raffle system
+        'completed_raffles': completed_raffles # NEW: Raffle system
     }
     try:
         with open(STATE_FILE, "w") as f:
@@ -4145,7 +4321,7 @@ def save_bot_state():
 
 def load_bot_state():
     """Loads the bot state from a single JSON file."""
-    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, escrow_deals, bot_stopped, bot_settings, group_settings, recovery_data, gift_codes
+    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, escrow_deals, bot_stopped, bot_settings, group_settings, recovery_data, gift_codes, referral_codes, active_raffles, completed_raffles
 
     # Load individual files first as a fallback
     load_all_user_data()
@@ -4173,6 +4349,9 @@ def load_bot_state():
             escrow_deals.update(state.get('escrow_deals', {}))
             bot_stopped = state.get('bot_stopped', False)
             bot_settings.update(state.get('bot_settings', {})) # NEW
+            referral_codes.update(state.get('referral_codes', {})) # NEW: Referral system
+            active_raffles.update(state.get('active_raffles', {})) # NEW: Raffle system
+            completed_raffles.extend(state.get('completed_raffles', [])) # NEW: Raffle system
             logging.info("Bot state restored successfully from state file.")
         except (json.JSONDecodeError, Exception) as e:
             logging.error(f"Could not load bot state from {STATE_FILE}: {e}. Relying on individual files.")
@@ -4595,7 +4774,9 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
             "referral": {
                 "referrer_id": referrer_id,
                 "referred_users": [],
-                "commission_earned": 0.0
+                "commission_earned": 0.0,
+                "code": generate_unique_referral_code(),  # NEW: User's unique referral code
+                "commissions": {}  # NEW: Per-currency commission tracking
             },
             "achievements": [], # NEW
             "last_daily_claim": None, # NEW
@@ -4620,6 +4801,10 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
         }
         if username:
             username_to_userid[normalize_username(username)] = user_id
+        
+        # NEW: Register the user's referral code in the global mapping
+        ref_code = user_stats[user_id]["referral"]["code"]
+        referral_codes[ref_code] = user_id
 
         # AUTO-GENERATE RECOVERY TOKEN FOR NEW USER
         token = secrets.token_hex(20)
@@ -4661,7 +4846,13 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
         if referrer_id:
             await ensure_user_in_wallets(referrer_id, context=context) # Pass context
             if 'referral' not in user_stats[referrer_id]:
-                 user_stats[referrer_id]['referral'] = {"referrer_id": None, "referred_users": [], "commission_earned": 0.0}
+                 user_stats[referrer_id]['referral'] = {"referrer_id": None, "referred_users": [], "commission_earned": 0.0, "code": generate_unique_referral_code(), "commissions": {}}
+                 # Register the code
+                 ref_code = user_stats[referrer_id]['referral']['code']
+                 referral_codes[ref_code] = referrer_id
+            # Ensure commissions dict exists for existing users
+            if 'commissions' not in user_stats[referrer_id]['referral']:
+                user_stats[referrer_id]['referral']['commissions'] = {}
             user_stats[referrer_id]['referral']['referred_users'].append(user_id)
             save_user_data(referrer_id)
             await check_and_award_achievements(referrer_id, None) # Check for referral achievements
@@ -4938,17 +5129,31 @@ async def process_referral_commission(user_id, amount, commission_type):
         return
 
     if commission_type == 'bet':
-        rate = REFERRAL_BET_COMMISSION_RATE
+        # NEW: 0.2% wager commission in active currency
+        active_currency = get_active_currency(user_id)
+        price = LIVE_PRICES.get(active_currency, 1.0)
+        crypto_amount = amount / price  # Convert USD bet to crypto
+        commission_crypto = crypto_amount * 0.002  # 0.2% in active crypto
+        
+        # Ensure commissions dict exists
+        if 'commissions' not in user_stats[referrer_id]['referral']:
+            user_stats[referrer_id]['referral']['commissions'] = {}
+        
+        # Add commission to referrer's balance
+        user_stats[referrer_id]['referral']['commissions'][active_currency] = (
+            user_stats[referrer_id]['referral']['commissions'].get(active_currency, 0.0) + commission_crypto
+        )
+        
+        # Also update the old commission_earned field for backward compatibility
+        commission_usd = commission_crypto * price
+        user_stats[referrer_id]['referral']['commission_earned'] = (
+            user_stats[referrer_id]['referral'].get('commission_earned', 0.0) + commission_usd
+        )
+        
+        save_user_data(referrer_id)
+        logging.info(f"Awarded {commission_crypto} {active_currency} wager commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
     else:
         return
-
-    commission = amount * rate
-    if commission > 0:
-        await ensure_user_in_wallets(referrer_id)
-        credit_wallet(referrer_id, commission)
-        user_stats[referrer_id]['referral']['commission_earned'] += commission
-        save_user_data(referrer_id)
-        logging.info(f"Awarded ${commission:.4f} commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
 
 def update_stats_on_withdrawal(user_id, amount, tx_hash, method):
     stats = user_stats[user_id]
@@ -5114,6 +5319,31 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
     stats.setdefault("monthly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
     stats["monthly_stats"]["weighted_wager"] += weighted_wager
     stats["monthly_stats"]["net_loss"] += net_loss_this_bet
+    
+    # NEW: Update raffle wager tracking
+    for raffle_id, raffle in list(active_raffles.items()):
+        # Check eligibility
+        eligible = False
+        if raffle['type'] == 'all':
+            eligible = True
+        elif raffle['type'] == 'referrals':
+            # Check if user is a referral of the creator
+            if user_id in user_stats and user_stats[user_id]['referral'].get('referrer_id') == raffle['creator']:
+                eligible = True
+        
+        if eligible:
+            # Add wager to tracker
+            if user_id not in raffle['wager_tracker']:
+                raffle['wager_tracker'][user_id] = 0.0
+            raffle['wager_tracker'][user_id] += amount
+            
+            # Check if user earned tickets
+            if user_id not in raffle['tickets']:
+                raffle['tickets'][user_id] = 0
+            
+            while raffle['wager_tracker'][user_id] >= raffle['ticket_cost']:
+                raffle['tickets'][user_id] += 1
+                raffle['wager_tracker'][user_id] -= raffle['ticket_cost']
     
     # NEW: Update leaderboards
     update_leaderboards(user_id, amount, win_amount, game_type, multiplier)
@@ -5554,6 +5784,16 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await games_menu(update, context)
 
     elif data == "main_escrow":
+        # NEW: Check if escrow is enabled
+        if not bot_settings.get("escrow_enabled", True):
+            await safe_edit_message(
+                query,
+                "❌ <b>Escrow Feature Disabled</b>\n\n"
+                "This feature is currently disabled by the owner.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+            return
         await escrow_command(update, context, from_callback=True)
 
     elif data == "main_wallet":
@@ -5640,6 +5880,16 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     ## NEW FEATURE - AI Integration ##
     elif data == "main_ai":
+        # NEW: Check if AI is enabled
+        if not bot_settings.get("ai_enabled", True):
+            await safe_edit_message(
+                query,
+                "❌ <b>AI Assistant Disabled</b>\n\n"
+                "This feature is currently disabled by the owner.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+            return
         return await start_ai_conversation(update, context)
 
     elif data == "main_support":
@@ -9936,6 +10186,9 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
     bot_total = sum(bot_rolls)
     bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
     
+    # NEW: Store bot roll values in context to prevent double rolling
+    context.user_data['pre_rolled_bot_values'] = bot_rolls
+    
     # Get user for mention
     user_id = match.get("host_id")
     user_mention = f'<a href="tg://user?id={user_id}">Player</a>' if user_id else "Player"
@@ -10400,6 +10653,9 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
             await asyncio.sleep(3.5)  # Wait for animation
     
     match["player_rolls"][0] = roll_values  # 0 = Bot
+    
+    # NEW: Store bot roll values in context to prevent double rolling
+    context.user_data['pre_rolled_bot_values'] = roll_values
     
     await query.edit_message_text(
         f"🤖 <b>BOT ROLLED FIRST!</b>\n\n"
@@ -13748,31 +14004,40 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
                 
-                # NOW bot rolls
-                bot_rolls = []
-                chat_type = update.effective_chat.type
-                for i in range(game_rolls):
-                    animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
-                    try:
-                        bot_dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, expected_emoji)
-                        bot_rolls.append(bot_dice_msg.dice.value)
-                        # Faster animation if helper bot was used
-                        if used_helper:
-                            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
-                        else:
-                            await asyncio.sleep(animation_wait)  # Smart wait based on chat type
-                    except Exception as e:
-                        logging.error(f"Error sending dice in PvB game: {e}")
-                        await update.message.reply_text("❌ An error occurred. Game terminated.")
-                        game['status'] = 'error'
-                        del context.chat_data[f"active_pvb_game_{user.id}"]
-                        if user.id in active_pvb_games:
-                            del active_pvb_games[user.id]
-                        # Refund bet
-                        credit_wallet(user.id, game['bet_amount'])
-                        update_pnl(user.id)
-                        save_user_data(user.id)
-                        return
+                # Check if bot already rolled (via "Bot rolls first" button)
+                pre_rolled_values = context.user_data.get('pre_rolled_bot_values')
+                
+                if pre_rolled_values:
+                    # Bot already rolled - use those values
+                    bot_rolls = pre_rolled_values
+                    # Clear the stored values
+                    context.user_data.pop('pre_rolled_bot_values', None)
+                else:
+                    # Bot hasn't rolled yet - roll now
+                    bot_rolls = []
+                    chat_type = update.effective_chat.type
+                    for i in range(game_rolls):
+                        animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
+                        try:
+                            bot_dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, expected_emoji)
+                            bot_rolls.append(bot_dice_msg.dice.value)
+                            # Faster animation if helper bot was used
+                            if used_helper:
+                                await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                            else:
+                                await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+                        except Exception as e:
+                            logging.error(f"Error sending dice in PvB game: {e}")
+                            await update.message.reply_text("❌ An error occurred. Game terminated.")
+                            game['status'] = 'error'
+                            del context.chat_data[f"active_pvb_game_{user.id}"]
+                            if user.id in active_pvb_games:
+                                del active_pvb_games[user.id]
+                            # Refund bet
+                            credit_wallet(user.id, game['bet_amount'])
+                            update_pnl(user.id)
+                            save_user_data(user.id)
+                            return
                 
                 game["bot_rolls"] = bot_rolls
                 bot_total = sum(bot_rolls)
@@ -13874,6 +14139,9 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     game["bot_rolls"] = bot_rolls
                     bot_total = sum(bot_rolls)
                     bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
+                    
+                    # NEW: Store bot roll values in context for next user response
+                    context.user_data['pre_rolled_bot_values'] = bot_rolls
                     
                     username_display = user.first_name if user.first_name else "Player"
                     await update.message.reply_text(
@@ -14686,6 +14954,20 @@ ERC20_ABI = json.loads('[{"constant":true,"inputs":[],"name":"name","outputs":[{
 async def escrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback=False):
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    # NEW: Check if escrow feature is enabled
+    if not bot_settings.get("escrow_enabled", True):
+        error_msg = "❌ This feature is currently disabled by the owner."
+        if from_callback: 
+            await safe_edit_message(
+                update.callback_query, 
+                error_msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]])
+            )
+        else: 
+            await update.message.reply_text(error_msg)
+        return
+    
     if not all([ESCROW_DEPOSIT_ADDRESS, ESCROW_WALLET_PRIVATE_KEY]):
         error_msg = "Escrow system is not configured by the owner yet."
         if from_callback: await safe_edit_message(update.callback_query, error_msg)
@@ -15378,6 +15660,61 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+    # FIX: Add highlow continuation
+    elif game_type == 'highlow':
+        text = f"🎯 Resuming High/Low Game (ID: <code>{game_id}</code>)..."
+        current_card = game['current_card']
+        deck = game['deck']
+        streak = game.get('streak', 0)
+        current_multiplier = game.get('current_multiplier', 1.0)
+        
+        card_name = get_card_name(current_card)
+        
+        # Calculate multipliers for each choice
+        high_mult = calculate_highlow_multiplier(current_card, deck, "high")
+        low_mult = calculate_highlow_multiplier(current_card, deck, "low")
+        tie_mult = calculate_highlow_multiplier(current_card, deck, "tie")
+        
+        # Build keyboard - row 1: Higher/Lower, row 2: Tie, row 3: Skip/Cashout
+        row1 = []
+        
+        # Add Higher button only if not King (13)
+        if current_card != 13:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬆️ Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+        
+        # Add Lower button only if not Ace (1)
+        if current_card != 1:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬇️ Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+        
+        # Row 2: Tie button
+        row2 = [apply_button_style(InlineKeyboardButton(f"🔄 Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+        
+        # Row 3: Skip Card and Cashout buttons (if streak > 0)
+        row3 = [apply_button_style(InlineKeyboardButton("⏭️ Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]
+        if streak > 0:
+            cashout_amount = game['bet_amount'] * current_multiplier
+            row3.append(apply_button_style(InlineKeyboardButton(f"💸 Cash Out (${cashout_amount:.2f})", callback_data=f"hl_cashout_{game_id}"), 'success'))
+        
+        keyboard = [row1, row2, row3]
+        
+        # Build multiplier text
+        mult_text = ""
+        if current_card != 13:
+            mult_text += f"⬆️ Higher: {high_mult:.2f}x\n"
+        if current_card != 1:
+            mult_text += f"⬇️ Lower: {low_mult:.2f}x\n"
+        mult_text += f"🔄 Tie: {tie_mult:.2f}x"
+        
+        msg = (
+            f"{text}\n\n"
+            f"🃏 <b>Current Card:</b> {card_name}\n"
+            f"💰 <b>Bet:</b> ${game['bet_amount']:.2f}\n"
+            f"🔥 <b>Streak:</b> {streak}\n"
+            f"📊 <b>Current Multiplier:</b> {current_multiplier:.2f}x\n\n"
+            f"<b>Multipliers:</b>\n{mult_text}"
+        )
+        
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=create_styled_keyboard(keyboard))
     else:
         await update.message.reply_text("This game type cannot be continued.")
 
@@ -15656,16 +15993,47 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 
     stats = user_stats[user.id]
     ref_info = stats.get('referral', {})
-
+    
+    # Ensure code exists (for backward compatibility)
+    if 'code' not in ref_info:
+        ref_info['code'] = generate_unique_referral_code()
+        referral_codes[ref_info['code']] = user.id
+        save_user_data(user.id)
+    
+    # Get commission details per currency
+    commissions = ref_info.get('commissions', {})
+    commission_text = ""
+    if commissions:
+        commission_text = "\n\n💎 <b>Accumulated Commissions:</b>\n"
+        for currency, amount in commissions.items():
+            if amount > 0:
+                symbol = CRYPTO_SYMBOLS.get(currency, "")
+                formatted = format_crypto_amount(amount, currency)
+                usd_value = amount * LIVE_PRICES.get(currency, 1.0)
+                commission_text += f"  {symbol} {formatted} {currency} (${usd_value:.2f})\n"
+    
     msg = (f"🤝 <b>Your Referral Dashboard</b> 🤝\n\n"
-           f"Share your unique link to earn commissions!\n\n"
+           f"Share your unique link or code to earn commissions!\n\n"
            f"🔗 <b>Your Link:</b>\n<code>{referral_link}</code>\n\n"
+           f"🎫 <b>Your Code:</b> <code>{ref_info.get('code', 'N/A')}</code>\n"
+           f"💡 Use <code>/setcode YOURCODE</code> to customize it\n\n"
            f"👥 <b>Total Referrals:</b> {len(ref_info.get('referred_users', []))}\n"
-           f"💰 <b>Total Commission Earned:</b> ${ref_info.get('commission_earned', 0.0):.4f}\n\n"
-           f"<b>Commission Rate:</b>\n"
-           f"- <b>{REFERRAL_BET_COMMISSION_RATE*100}%</b> of every bet amount placed by your referrals.")
-
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to More", callback_data="main_more")]]) if from_callback else None
+           f"💰 <b>Total Commission Earned:</b> ${ref_info.get('commission_earned', 0.0):.4f}"
+           f"{commission_text}\n\n"
+           f"<b>Commission Rates:</b>\n"
+           f"- <b>0.5%</b> of deposits (in native crypto)\n"
+           f"- <b>0.2%</b> of wagers (in active currency)")
+    
+    # Add buttons for transferring commissions and viewing referrals
+    keyboard = []
+    if commissions and any(v > 0 for v in commissions.values()):
+        keyboard.append([apply_button_style(InlineKeyboardButton("📥 Transfer to Balance", callback_data=f"ref_transfer_{user.id}"), 'success')])
+    
+    if len(ref_info.get('referred_users', [])) > 0:
+        keyboard.append([apply_button_style(InlineKeyboardButton("👥 Check My Referrals", callback_data=f"ref_check_{user.id}"), 'primary')])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back to More", callback_data="main_more")])
+    reply_markup = create_styled_keyboard(keyboard) if from_callback else (create_styled_keyboard(keyboard) if keyboard else None)
 
     if from_callback:
         await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup, disable_web_page_preview=True)
@@ -15675,6 +16043,516 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         if reply_markup:
             set_menu_owner(sent_message, user.id)
 
+# NEW: Set custom referral code
+@check_banned
+@check_maintenance
+async def setcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: <code>/setcode YOUR_CODE</code>\n\n"
+            "Requirements:\n"
+            "• 4-12 alphanumeric characters\n"
+            "• No special characters or spaces\n\n"
+            "Example: <code>/setcode MYCODE123</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    new_code = context.args[0].upper()
+    
+    # Validate code
+    if not new_code.isalnum():
+        await update.message.reply_text("❌ Code must be alphanumeric (letters and numbers only).")
+        return
+    
+    if len(new_code) < 4 or len(new_code) > 12:
+        await update.message.reply_text("❌ Code must be between 4 and 12 characters long.")
+        return
+    
+    # Check if code already exists
+    if new_code in referral_codes and referral_codes[new_code] != user.id:
+        await update.message.reply_text("❌ This code is already taken. Please choose a different one.")
+        return
+    
+    # Update user's code
+    stats = user_stats[user.id]
+    old_code = stats['referral'].get('code')
+    
+    # Remove old code from global mapping
+    if old_code and old_code in referral_codes:
+        del referral_codes[old_code]
+    
+    # Add new code
+    stats['referral']['code'] = new_code
+    referral_codes[new_code] = user.id
+    save_user_data(user.id)
+    save_bot_state()
+    
+    bot_username = (await context.bot.get_me()).username
+    await update.message.reply_text(
+        f"✅ Your referral code has been updated!\n\n"
+        f"🎫 <b>Your New Code:</b> <code>{new_code}</code>\n\n"
+        f"Share this link:\n<code>https://t.me/{bot_username}?start=ref_{user.id}</code>\n\n"
+        f"Or tell users to use: <code>/code {new_code}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+# NEW: Set referrer using a code
+@check_banned
+@check_maintenance
+async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: <code>/code REFERRAL_CODE</code>\n\n"
+            "Use this to set your referrer if you forgot to use their link.\n\n"
+            "Example: <code>/code ABC123</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    code = context.args[0].upper()
+    
+    # Check if user already has a referrer
+    stats = user_stats[user.id]
+    if stats['referral'].get('referrer_id'):
+        await update.message.reply_text("❌ You already have a referrer set. You cannot change it.")
+        return
+    
+    # Look up the code
+    if code not in referral_codes:
+        await update.message.reply_text("❌ Invalid referral code. Please check and try again.")
+        return
+    
+    referrer_id = referral_codes[code]
+    
+    # Can't refer yourself
+    if referrer_id == user.id:
+        await update.message.reply_text("❌ You cannot use your own referral code.")
+        return
+    
+    # Set the referrer
+    stats['referral']['referrer_id'] = referrer_id
+    
+    # Add to referrer's referred_users list
+    await ensure_user_in_wallets(referrer_id, context=context)
+    if 'commissions' not in user_stats[referrer_id]['referral']:
+        user_stats[referrer_id]['referral']['commissions'] = {}
+    user_stats[referrer_id]['referral']['referred_users'].append(user.id)
+    
+    save_user_data(user.id)
+    save_user_data(referrer_id)
+    
+    await update.message.reply_text(
+        f"✅ Referrer set successfully!\n\n"
+        f"You will now earn commissions for your referrer on deposits and wagers."
+    )
+    
+    # Notify referrer
+    try:
+        await context.bot.send_message(
+            chat_id=referrer_id,
+            text=f"🎉 New referral! User {user.id} has used your code and set you as their referrer.",
+            parse_mode=ParseMode.HTML
+        )
+    except (BadRequest, Forbidden):
+        pass
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW FEATURE: COMPREHENSIVE RAFFLE SYSTEM
+# ═══════════════════════════════════════════════════════════════════
+
+@check_banned
+@check_maintenance
+async def raffle_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for /raffle command - show type selection"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🔵 Referrals Only", callback_data="raffle_type_referrals"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🟢 All Players", callback_data="raffle_type_all"), 'success')],
+        [apply_button_style(InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel"), 'danger')]
+    ]
+    
+    await safe_edit_message(
+        query,
+        "🎰 <b>Create a Raffle</b>\n\n"
+        "Choose the raffle type:\n\n"
+        "🔵 <b>Referrals Only:</b> Only your referrals can participate\n"
+        "🟢 <b>All Players:</b> Anyone can participate by wagering",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    return ConversationHandler.END
+
+async def raffle_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle raffle type selection"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    raffle_type = query.data.split('_')[-1]  # 'referrals' or 'all'
+    context.user_data['raffle_type'] = raffle_type
+    context.user_data['raffle_creator'] = user.id
+    
+    await safe_edit_message(
+        query,
+        f"🎰 <b>Create Raffle - {raffle_type.title()}</b>\n\n"
+        f"Enter the <b>prize amount in USD</b>:\n\n"
+        f"Your balance: ${get_active_balance_usd(user.id):.2f}\n\n"
+        f"The amount will be deducted from your balance immediately.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+    )
+    return RAFFLE_PRIZE_AMOUNT
+
+async def raffle_prize_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect prize amount"""
+    user = update.effective_user
+    try:
+        prize_usd = float(update.message.text)
+        if prize_usd <= 0:
+            await update.message.reply_text("❌ Prize must be positive. Try again:")
+            return RAFFLE_PRIZE_AMOUNT
+        
+        balance = get_active_balance_usd(user.id)
+        if prize_usd > balance:
+            await update.message.reply_text(
+                f"❌ Insufficient balance. You have ${balance:.2f}. Try again:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+            )
+            return RAFFLE_PRIZE_AMOUNT
+        
+        # Deduct prize from balance immediately
+        deduct_wallet(user.id, prize_usd)
+        save_user_data(user.id)
+        
+        context.user_data['raffle_prize_usd'] = prize_usd
+        
+        await update.message.reply_text(
+            f"✅ Prize set to ${prize_usd:.2f} (deducted from balance)\n\n"
+            f"Enter the <b>wager amount needed for 1 ticket</b> (in USD):\n\n"
+            f"Example: 10 (users need to wager $10 to earn 1 ticket)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_TICKET_COST
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Enter a number:")
+        return RAFFLE_PRIZE_AMOUNT
+
+async def raffle_ticket_cost_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect ticket cost"""
+    try:
+        ticket_cost = float(update.message.text)
+        if ticket_cost <= 0:
+            await update.message.reply_text("❌ Ticket cost must be positive. Try again:")
+            return RAFFLE_TICKET_COST
+        
+        context.user_data['raffle_ticket_cost'] = ticket_cost
+        
+        await update.message.reply_text(
+            f"✅ Ticket cost set to ${ticket_cost:.2f}\n\n"
+            f"Enter the <b>raffle duration in days</b> (1-30):\n\n"
+            f"Example: 7 (raffle runs for 7 days)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_DURATION
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Enter a number:")
+        return RAFFLE_TICKET_COST
+
+async def raffle_duration_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect raffle duration"""
+    try:
+        duration_days = int(update.message.text)
+        if duration_days <= 0 or duration_days > 30:
+            await update.message.reply_text("❌ Duration must be between 1 and 30 days. Try again:")
+            return RAFFLE_DURATION
+        
+        context.user_data['raffle_duration_days'] = duration_days
+        
+        await update.message.reply_text(
+            f"✅ Duration set to {duration_days} days\n\n"
+            f"Enter the <b>number of winners</b> (1-100):\n\n"
+            f"Example: 5 (5 winners will be selected)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="raffle_cancel")]])
+        )
+        return RAFFLE_NUM_WINNERS
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Enter an integer:")
+        return RAFFLE_DURATION
+
+async def raffle_num_winners_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect number of winners and create raffle"""
+    user = update.effective_user
+    try:
+        num_winners = int(update.message.text)
+        if num_winners <= 0 or num_winners > 100:
+            await update.message.reply_text("❌ Number of winners must be between 1 and 100. Try again:")
+            return RAFFLE_NUM_WINNERS
+        
+        # Create the raffle
+        raffle_id = generate_unique_id("RAFFLE")
+        end_time = datetime.now(timezone.utc) + timedelta(days=context.user_data['raffle_duration_days'])
+        
+        active_raffles[raffle_id] = {
+            "id": raffle_id,
+            "creator": user.id,
+            "type": context.user_data['raffle_type'],  # 'referrals' or 'all'
+            "prize_usd": context.user_data['raffle_prize_usd'],
+            "ticket_cost": context.user_data['raffle_ticket_cost'],
+            "end_time": str(end_time),
+            "total_winners": num_winners,
+            "tickets": {},  # {user_id: ticket_count}
+            "wager_tracker": {}  # {user_id: accumulated_wager}
+        }
+        save_bot_state()
+        
+        # Clear context data
+        for key in ['raffle_type', 'raffle_creator', 'raffle_prize_usd', 'raffle_ticket_cost', 'raffle_duration_days']:
+            context.user_data.pop(key, None)
+        
+        await update.message.reply_text(
+            f"✅ <b>Raffle Created!</b>\n\n"
+            f"🎰 <b>Raffle ID:</b> <code>{raffle_id}</code>\n"
+            f"💰 <b>Prize Pool:</b> ${active_raffles[raffle_id]['prize_usd']:.2f}\n"
+            f"🎫 <b>Ticket Cost:</b> ${active_raffles[raffle_id]['ticket_cost']:.2f} wagered\n"
+            f"👥 <b>Type:</b> {active_raffles[raffle_id]['type'].title()}\n"
+            f"🏆 <b>Winners:</b> {num_winners}\n"
+            f"⏰ <b>Ends:</b> {end_time.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"Players will automatically earn tickets by wagering!\n"
+            f"Use <code>/info {raffle_id}</code> to check progress.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Enter an integer:")
+        return RAFFLE_NUM_WINNERS
+
+async def raffle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel raffle creation"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    # Refund prize if it was deducted
+    if 'raffle_prize_usd' in context.user_data:
+        prize = context.user_data['raffle_prize_usd']
+        credit_wallet(user.id, prize)
+        save_user_data(user.id)
+        await safe_edit_message(query, f"❌ Raffle creation cancelled. ${prize:.2f} refunded.", parse_mode=ParseMode.HTML)
+    else:
+        await safe_edit_message(query, "❌ Raffle creation cancelled.", parse_mode=ParseMode.HTML)
+    
+    # Clear context
+    for key in ['raffle_type', 'raffle_creator', 'raffle_prize_usd', 'raffle_ticket_cost', 'raffle_duration_days']:
+        context.user_data.pop(key, None)
+    
+    return ConversationHandler.END
+
+@check_banned
+@check_maintenance
+async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start raffle creation flow"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🔵 Referrals Only", callback_data="raffle_type_referrals"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🟢 All Players", callback_data="raffle_type_all"), 'success')],
+    ]
+    
+    sent_message = await update.message.reply_text(
+        "🎰 <b>Create a Raffle</b>\n\n"
+        "Choose the raffle type:\n\n"
+        "🔵 <b>Referrals Only:</b> Only your referrals can participate\n"
+        "🟢 <b>All Players:</b> Anyone can participate by wagering",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    set_menu_owner(sent_message, user.id)
+
+@check_banned
+@check_maintenance
+async def raffles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show raffles dashboard"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🎰 My Raffles", callback_data=f"raffles_mine_{user.id}"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🌟 Active Raffles", callback_data="raffles_active"), 'success')],
+    ]
+    
+    sent_message = await update.message.reply_text(
+        "🎰 <b>Raffle Dashboard</b>\n\n"
+        "Select an option:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+    set_menu_owner(sent_message, user.id)
+
+async def raffles_mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's created raffles"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    my_raffles = [r for r in active_raffles.values() if r['creator'] == user_id]
+    
+    if not my_raffles:
+        await safe_edit_message(
+            query,
+            "❌ You haven't created any active raffles.\n\n"
+            "Use <code>/raffle</code> to create one!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+        )
+        return
+    
+    msg = "🎰 <b>Your Active Raffles</b>\n\n"
+    for raffle in my_raffles:
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        
+        msg += (
+            f"<b>ID:</b> <code>{raffle['id']}</code>\n"
+            f"💰 Prize: ${raffle['prize_usd']:.2f} | 🎫 {total_tickets} tickets | 👥 {participants} players\n"
+            f"⏰ Ends in: {time_left.days}d {time_left.seconds//3600}h\n"
+            f"Use <code>/info {raffle['id']}</code> for details\n\n"
+        )
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+    )
+
+async def raffles_active_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active raffles"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not active_raffles:
+        await safe_edit_message(
+            query,
+            "❌ No active raffles at the moment.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+        )
+        return
+    
+    msg = "🌟 <b>Active Raffles</b>\n\n"
+    raffle_list = list(active_raffles.values())[:10]  # Limit to 10
+    if len(active_raffles) > 10:
+        msg += f"<i>Showing first 10 of {len(active_raffles)} active raffles</i>\n\n"
+    
+    for raffle in raffle_list:
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        
+        msg += (
+            f"<b>ID:</b> <code>{raffle['id']}</code>\n"
+            f"💰 Prize: ${raffle['prize_usd']:.2f} | Type: {raffle['type'].title()}\n"
+            f"🎫 {total_tickets} tickets | 👥 {participants} players | 🏆 {raffle['total_winners']} winners\n"
+            f"⏰ {time_left.days}d {time_left.seconds//3600}h left\n\n"
+        )
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="raffles_back")]])
+    )
+
+async def raffles_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return to raffles menu"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    keyboard = [
+        [apply_button_style(InlineKeyboardButton("🎰 My Raffles", callback_data=f"raffles_mine_{user.id}"), 'primary')],
+        [apply_button_style(InlineKeyboardButton("🌟 Active Raffles", callback_data="raffles_active"), 'success')],
+    ]
+    
+    await safe_edit_message(
+        query,
+        "🎰 <b>Raffle Dashboard</b>\n\n"
+        "Select an option:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_styled_keyboard(keyboard)
+    )
+
+@check_banned
+@check_maintenance
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed raffle info"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: <code>/info RAFFLE_ID</code>", parse_mode=ParseMode.HTML)
+        return
+    
+    raffle_id = context.args[0]
+    
+    if raffle_id not in active_raffles:
+        await update.message.reply_text("❌ Raffle not found or has ended.")
+        return
+    
+    raffle = active_raffles[raffle_id]
+    end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+    time_left = end_time - datetime.now(timezone.utc)
+    total_tickets = sum(raffle['tickets'].values())
+    participants = len(raffle['tickets'])
+    
+    # User's tickets
+    user_tickets = raffle['tickets'].get(user.id, 0)
+    user_wager = raffle['wager_tracker'].get(user.id, 0.0)
+    
+    msg = (
+        f"🎰 <b>Raffle Details</b>\n\n"
+        f"<b>ID:</b> <code>{raffle_id}</code>\n"
+        f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
+        f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
+        f"👥 <b>Type:</b> {raffle['type'].title()}\n"
+        f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
+        f"⏰ <b>Time Left:</b> {time_left.days}d {time_left.seconds//3600}h {(time_left.seconds//60)%60}m\n\n"
+        f"📊 <b>Statistics:</b>\n"
+        f"🎫 Total Tickets: {total_tickets}\n"
+        f"👥 Participants: {participants}\n\n"
+        f"<b>Your Progress:</b>\n"
+        f"🎫 Your Tickets: {user_tickets}\n"
+        f"💵 Your Wagered: ${user_wager:.2f}\n"
+    )
+    
+    if raffle['type'] == 'referrals':
+        msg += f"\n💡 Only referrals of the creator can participate"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 ## NEW FEATURE - /level and /levelall commands ##
 def create_progress_bar(progress, total, length=10):
     """Creates a text-based progress bar."""
@@ -15683,6 +16561,98 @@ def create_progress_bar(progress, total, length=10):
     filled_length = min(length, int(length * progress // total))
     bar = '■' * filled_length + '□' * (length - filled_length)
     return bar
+
+# NEW: Referral callback handlers
+async def referral_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Transfer accumulated referral commissions to main balance"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+    
+    await query.answer()
+    await ensure_user_in_wallets(user_id, query.from_user.username, context=context)
+    
+    stats = user_stats[user_id]
+    commissions = stats['referral'].get('commissions', {})
+    
+    if not commissions or not any(v > 0 for v in commissions.values()):
+        await safe_edit_message(
+            query,
+            "❌ No commissions to transfer.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Referral", callback_data="main_referral")]])
+        )
+        return
+    
+    # Transfer each currency to user's wallet
+    transfer_summary = []
+    for currency, amount in list(commissions.items()):
+        if amount > 0:
+            credit_wallet_crypto(user_id, amount, currency)
+            symbol = CRYPTO_SYMBOLS.get(currency, "")
+            formatted = format_crypto_amount(amount, currency)
+            usd_value = amount * LIVE_PRICES.get(currency, 1.0)
+            transfer_summary.append(f"  {symbol} {formatted} {currency} (${usd_value:.2f})")
+            commissions[currency] = 0.0
+    
+    save_user_data(user_id)
+    
+    msg = (
+        "✅ <b>Commission Transfer Complete!</b>\n\n"
+        "Transferred to your balance:\n" + "\n".join(transfer_summary) + "\n\n"
+        "Your commissions have been reset to 0."
+    )
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Referral", callback_data="main_referral")]])
+    )
+
+async def referral_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of referrals with their stats"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+    
+    await query.answer()
+    await ensure_user_in_wallets(user_id, query.from_user.username, context=context)
+    
+    stats = user_stats[user_id]
+    referred_users = stats['referral'].get('referred_users', [])
+    
+    if not referred_users:
+        await safe_edit_message(
+            query,
+            "❌ You haven't referred anyone yet.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Referral", callback_data="main_referral")]])
+        )
+        return
+    
+    msg = "👥 <b>Your Referrals</b>\n\n"
+    
+    for ref_user_id in referred_users:
+        if ref_user_id in user_stats:
+            ref_stats = user_stats[ref_user_id]
+            total_wagered = ref_stats.get('bets', {}).get('amount', 0.0)
+            total_deposits = sum(d.get('amount', 0.0) for d in ref_stats.get('deposits', []))
+            msg += f"• User {ref_user_id}\n"
+            msg += f"  Wagered: ${total_wagered:,.2f} | Deposits: ${total_deposits:,.2f}\n\n"
+    
+    msg += f"Total: {len(referred_users)} referrals"
+    
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Referral", callback_data="main_referral")]])
+    )
 
 @check_banned
 @check_maintenance
@@ -15845,6 +16815,12 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_maintenance
 async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
+    
+    # NEW: Check if AI feature is enabled
+    if not bot_settings.get("ai_enabled", True):
+        await update.message.reply_text("❌ This feature is currently disabled by the owner.")
+        return
+    
     prompt_text = ""
     # Check for reply context
     if update.message.reply_to_message and update.message.reply_to_message.text:
@@ -16893,6 +17869,64 @@ async def dailyon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bonus_amount = bot_settings.get("daily_bonus_amount", 0.50)
     await update.message.reply_text(f"✅ Daily bonus feature has been enabled. Current daily bonus amount: ${bonus_amount:.2f}")
 
+# NEW: Escrow toggle commands (owner only)
+async def escrow_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle escrow feature on/off. Usage: /escrow on|off"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ This is an admin-only command.")
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or context.args[0].lower() not in ['on', 'off']:
+        current_status = "enabled" if bot_settings.get("escrow_enabled", True) else "disabled"
+        await update.message.reply_text(
+            f"🛡️ <b>Escrow Feature Status</b>\n\n"
+            f"Current: <b>{current_status.upper()}</b>\n\n"
+            f"Usage: <code>/escrow on</code> or <code>/escrow off</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = context.args[0].lower()
+    if action == 'off':
+        bot_settings["escrow_enabled"] = False
+        save_bot_state()
+        await update.message.reply_text("✅ Escrow feature has been <b>DISABLED</b>. Users will not be able to access escrow services.", parse_mode=ParseMode.HTML)
+    else:
+        bot_settings["escrow_enabled"] = True
+        save_bot_state()
+        await update.message.reply_text("✅ Escrow feature has been <b>ENABLED</b>. Users can now access escrow services.", parse_mode=ParseMode.HTML)
+
+# NEW: AI toggle commands (owner only)
+async def ai_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle AI assistant feature on/off. Usage: /ai on|off"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ This is an admin-only command.")
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    
+    if not context.args or context.args[0].lower() not in ['on', 'off']:
+        current_status = "enabled" if bot_settings.get("ai_enabled", True) else "disabled"
+        await update.message.reply_text(
+            f"🤖 <b>AI Assistant Feature Status</b>\n\n"
+            f"Current: <b>{current_status.upper()}</b>\n\n"
+            f"Usage: <code>/ai on</code> or <code>/ai off</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = context.args[0].lower()
+    if action == 'off':
+        bot_settings["ai_enabled"] = False
+        save_bot_state()
+        await update.message.reply_text("✅ AI Assistant feature has been <b>DISABLED</b>. Users will not be able to access AI services.", parse_mode=ParseMode.HTML)
+    else:
+        bot_settings["ai_enabled"] = True
+        save_bot_state()
+        await update.message.reply_text("✅ AI Assistant feature has been <b>ENABLED</b>. Users can now access AI services.", parse_mode=ParseMode.HTML)
+
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -17114,13 +18148,25 @@ async def more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
     await query.answer()
     
     # All items that were previously in the main menu (except Deposit, Withdraw, Games, Settings, Admin)
-    all_items = [
-        ("🛡️ Escrow", "main_escrow", 'primary'),  # BLUE
+    # NEW: Conditionally add Escrow and AI based on bot_settings
+    all_items = []
+    
+    # Add Escrow only if enabled
+    if bot_settings.get("escrow_enabled", True):
+        all_items.append(("🛡️ Escrow", "main_escrow", 'primary'))  # BLUE
+    
+    all_items.extend([
         ("💼 Wallet", "main_wallet", 'primary'),  # BLUE
         ("📈 Leaderboard", "main_leaderboard", 'primary'),  # BLUE
         ("🤝 Referral", "main_referral", 'primary'),  # BLUE
         ("🦄 Level", "main_level", 'primary'),  # BLUE
-        ("🤖 AI Assistant", "main_ai", 'primary'),  # BLUE
+    ])
+    
+    # Add AI Assistant only if enabled
+    if bot_settings.get("ai_enabled", True):
+        all_items.append(("🤖 AI Assistant", "main_ai", 'primary'))  # BLUE
+    
+    all_items.extend([
         ("🏆 Achievements", "main_achievements", 'primary'),  # BLUE
         ("🆘 Support", "main_support", 'primary'),  # BLUE
         ("❓ Help", "main_help", 'primary'),  # BLUE
@@ -17128,7 +18174,7 @@ async def more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
         ("🎟️ Claim Gift Code", "main_claim_gift", 'primary'),  # BLUE
         ("📊 Stats", "main_stats", 'primary'),  # BLUE
         ("💱 Currency", "settings_currency", 'primary'),  # BLUE
-    ]
+    ])
     
     keyboard = []
     # Add all items (2 per row) with colors
@@ -17881,6 +18927,9 @@ async def post_init(application: Application):
     # Start the live price engine (MEXC API, every 5 minutes)
     application.create_task(update_live_prices())
     
+    # Start the raffle monitoring task
+    application.create_task(monitor_raffles_task(application))
+    
     logging.info("Background tasks started successfully via post_init")
 # --- Main Function ---)
 # ===== BONUS ADJUSTMENT SYSTEM =====
@@ -18275,6 +19324,19 @@ def main():
         per_message=False,
         conversation_timeout=timedelta(minutes=5).total_seconds()
     )
+    
+    raffle_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(raffle_type_callback, pattern="^raffle_type_")],
+        states={
+            RAFFLE_PRIZE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_prize_step)],
+            RAFFLE_TICKET_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_ticket_cost_step)],
+            RAFFLE_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_duration_step)],
+            RAFFLE_NUM_WINNERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, raffle_num_winners_step)],
+        },
+        fallbacks=[CallbackQueryHandler(raffle_cancel_callback, pattern="^raffle_cancel$")],
+        per_user=True,
+        conversation_timeout=timedelta(minutes=5).total_seconds()
+    )
 
     recovery_handler = ConversationHandler(
         entry_points=[CommandHandler("recover", recover_command)],
@@ -18357,6 +19419,11 @@ def main():
     app.add_handler(CommandHandler("pin", pin_command)); app.add_handler(CommandHandler("purge", purge_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("referral", referral_command))
+    app.add_handler(CommandHandler("setcode", setcode_command)) # NEW: Referral system
+    app.add_handler(CommandHandler("code", code_command)) # NEW: Referral system
+    app.add_handler(CommandHandler("raffle", raffle_command)) # NEW: Raffle system
+    app.add_handler(CommandHandler("raffles", raffles_command)) # NEW: Raffle system
+    app.add_handler(CommandHandler("info", info_command)) # NEW: Raffle system
     app.add_handler(CommandHandler("user", user_info_command))
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("p", price_command))
@@ -18368,6 +19435,8 @@ def main():
     app.add_handler(CommandHandler("setdaily", setdaily_command)) # NEW
     app.add_handler(CommandHandler("dailyoff", dailyoff_command)) # NEW
     app.add_handler(CommandHandler("dailyon", dailyon_command)) # NEW
+    app.add_handler(CommandHandler("escrow", escrow_toggle_command)) # NEW: Toggle escrow feature
+    app.add_handler(CommandHandler("aioff", ai_toggle_command)) # NEW: Toggle AI feature (using aioff/aion to avoid conflict with /ai command)
     app.add_handler(CommandHandler("games", games_menu)) # New alias
     app.add_handler(CommandHandler("tower", tower_command)) # NEW - Tower game
     app.add_handler(CommandHandler("tr", tower_command)) # NEW - Tower game alias
@@ -18408,6 +19477,7 @@ def main():
     app.add_handler(tower_handler)  # NEW - Tower game conversation
     app.add_handler(pvb_handler)
     app.add_handler(ai_handler)
+    app.add_handler(raffle_handler)  # NEW - Raffle creation conversation
     app.add_handler(recovery_handler)
     app.add_handler(withdrawal_address_handler)
     app.add_handler(withdrawal_flow_handler)
@@ -18438,6 +19508,11 @@ def main():
     app.add_handler(CallbackQueryHandler(xdxw_playbot_callback, pattern=r"^xdxw_playbot_")) # NEW - XdX'w play with bot
     app.add_handler(CallbackQueryHandler(xdxw_bot_first_callback, pattern=r"^xdxw_bot_first_")) # NEW - XdX'w bot rolls first
     app.add_handler(CallbackQueryHandler(level_all_command, pattern=r"^levels_")) # NEW - Level pagination
+    app.add_handler(CallbackQueryHandler(referral_transfer_callback, pattern=r"^ref_transfer_")) # NEW - Referral transfer
+    app.add_handler(CallbackQueryHandler(referral_check_callback, pattern=r"^ref_check_")) # NEW - Check referrals
+    app.add_handler(CallbackQueryHandler(raffles_mine_callback, pattern=r"^raffles_mine_")) # NEW - Raffle system
+    app.add_handler(CallbackQueryHandler(raffles_active_callback, pattern=r"^raffles_active")) # NEW - Raffle system
+    app.add_handler(CallbackQueryHandler(raffles_back_callback, pattern=r"^raffles_back")) # NEW - Raffle system
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern=r"^price_update_")) # NEW
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_")); app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_"))
     
